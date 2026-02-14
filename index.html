@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>Voxel Architect v5.1 - Fixed</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; user-select: none; }
+        
+        /* 準心 (Crosshair) */
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 10;
+        }
+        #crosshair::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 4px;
+            height: 4px;
+            background: red;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        /* 資訊面板 */
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            font-family: 'Segoe UI', sans-serif;
+            background: rgba(0, 0, 0, 0.75);
+            padding: 20px;
+            border-radius: 12px;
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255,255,255,0.15);
+            pointer-events: none; /* 讓滑鼠穿透面板 */
+            min-width: 260px;
+        }
+        
+        .key {
+            display: inline-block;
+            background: #444;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 0.9em;
+            margin: 2px;
+            font-weight: 600;
+            border-bottom: 2px solid #222;
+        }
+        
+        .mode-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-weight: 800;
+            margin-bottom: 15px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        .mode-build { background: #4f9de0; color: white; box-shadow: 0 0 10px #4f9de0aa; }
+        .mode-physics { background: #e04f5f; color: white; box-shadow: 0 0 10px #e04f5faa; }
+
+        .lil-gui { --width: 320px; }
+    </style>
+</head>
+<body>
+
+    <div id="crosshair"></div>
+
+    <div id="info">
+        <h2 style="margin: 0 0 10px 0; font-weight: 800;">ARCHITECT v5.1</h2>
+        <div id="status-badge" class="mode-badge mode-build">MODE: BUILD</div>
+        
+        <div id="controls-build">
+            <div style="margin-bottom:5px"><span class="key">左鍵</span> 放置方塊</div>
+            <div style="margin-bottom:5px"><span class="key">右鍵</span> 刪除方塊</div>
+            <div><span class="key">中鍵</span> 旋轉視角</div>
+        </div>
+        
+        <div id="controls-physics" style="display:none;">
+            <div style="margin-bottom:5px"><span class="key">左鍵</span> 朝游標發射</div>
+            <div style="margin-bottom:5px"><span class="key">面板按鈕</span> 朝準心發射</div>
+            <div style="margin-top:10px; color:#ff6b6b; font-size:0.9em;">
+                ⚠️ 物理模擬進行中
+            </div>
+        </div>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+        import * as CANNON from 'cannon-es';
+
+        let camera, scene, renderer, controls;
+        let plane, raycaster, pointer;
+        let rollOverMesh, rollOverMaterial;
+        let objects = []; 
+        let world;
+        let physicsEnabled = false;
+        let objectsToUpdate = []; 
+        let cannonMaterials = {};
+        
+        const params = {
+            mode: 'Build',
+            shape: 'Box',
+            color: '#4f9de0',
+            gravity: -20,
+            ballSize: 10,
+            ballSpeed: 200,
+            fire: function() { fireFromCamera(); }, // 按鈕觸發
+            reset: function() {
+                if(confirm('確定要清空場景嗎？')) resetScene();
+            }
+        };
+
+        const geometries = {
+            'Box': new THREE.BoxGeometry(50, 50, 50),
+            'Sphere': new THREE.SphereGeometry(25, 32, 16),
+            'Cylinder': new THREE.CylinderGeometry(25, 25, 50, 32),
+            'Cone': new THREE.ConeGeometry(25, 50, 32),
+            'Pyramid': new THREE.ConeGeometry(35, 50, 4),
+            'Donut': new THREE.TorusGeometry(20, 10, 16, 50)
+        };
+
+        init();
+        initPhysics();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+            scene.fog = new THREE.FogExp2(0x1a1a2e, 0.0005);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 10000);
+            camera.position.set(500, 500, 800);
+            camera.lookAt(0, 0, 0);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+            
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+            dirLight.position.set(300, 800, 500);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.set(4096, 4096);
+            dirLight.shadow.camera.near = 0.5;
+            dirLight.shadow.camera.far = 3000;
+            dirLight.shadow.camera.left = -1000;
+            dirLight.shadow.camera.right = 1000;
+            dirLight.shadow.camera.top = 1000;
+            dirLight.shadow.camera.bottom = -1000;
+            scene.add(dirLight);
+
+            rollOverMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000, opacity: 0.5, transparent: true, wireframe: true });
+            rollOverMesh = new THREE.Mesh(geometries['Box'], rollOverMaterial);
+            scene.add(rollOverMesh);
+
+            const gridHelper = new THREE.GridHelper(3000, 60, 0x444444, 0x222222);
+            scene.add(gridHelper);
+
+            const geometry = new THREE.PlaneGeometry(3000, 3000);
+            geometry.rotateX(-Math.PI / 2);
+            plane = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ visible: false }));
+            scene.add(plane);
+            objects.push(plane);
+
+            const floorMesh = new THREE.Mesh(
+                new THREE.PlaneGeometry(3000, 3000),
+                new THREE.MeshStandardMaterial({ color: 0x0f0f1a, roughness: 0.8 })
+            );
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.position.y = -0.5;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.ROTATE, RIGHT: null };
+
+            raycaster = new THREE.Raycaster();
+            pointer = new THREE.Vector2();
+
+            setupGUI();
+
+            document.addEventListener('pointermove', onPointerMove);
+            document.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function initPhysics() {
+            world = new CANNON.World();
+            world.gravity.set(0, params.gravity, 0);
+            world.broadphase = new CANNON.SAPBroadphase(world);
+            world.allowSleep = true;
+
+            const defaultMat = new CANNON.Material('default');
+            const contactMat = new CANNON.ContactMaterial(defaultMat, defaultMat, {
+                friction: 0.3,
+                restitution: 0.5
+            });
+            world.addContactMaterial(contactMat);
+            cannonMaterials.default = defaultMat;
+
+            const floorShape = new CANNON.Plane();
+            const floorBody = new CANNON.Body({ mass: 0 });
+            floorBody.addShape(floorShape);
+            floorBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI * 0.5);
+            world.addBody(floorBody);
+        }
+
+        function setupGUI() {
+            const gui = new GUI({ title: 'CONTROL PANEL' });
+            
+            gui.add(params, 'mode', ['Build', 'Physics']).name('模式切換').onChange(switchMode).listen();
+
+            const folderBuild = gui.addFolder('🏗️ 建造設定');
+            folderBuild.addColor(params, 'color').name('材質顏色').onChange(updateGhost);
+            folderBuild.add(params, 'shape', ['Box', 'Sphere', 'Cylinder', 'Cone', 'Pyramid', 'Donut']).name('幾何形狀').onChange(updateGhost);
+            
+            const folderPhys = gui.addFolder('💣 物理設定');
+            folderPhys.add(params, 'gravity', -50, -1).name('重力 G').onChange(v => world.gravity.set(0, v, 0));
+            folderPhys.add(params, 'ballSize', 5, 50).name('砲彈大小');
+            folderPhys.add(params, 'ballSpeed', 50, 500).name('發射威力');
+            
+            // 按鈕發射
+            folderPhys.add(params, 'fire').name('🔥 發射 (Fire)');
+
+            gui.add(params, 'reset').name('♻️ 清空 (Reset)');
+            
+            folderBuild.open();
+            folderPhys.open();
+        }
+
+        function switchMode(mode) {
+            const badge = document.getElementById('status-badge');
+            const cBuild = document.getElementById('controls-build');
+            const cPhys = document.getElementById('controls-physics');
+            const crosshair = document.getElementById('crosshair');
+
+            if (mode === 'Physics') {
+                physicsEnabled = true;
+                rollOverMesh.visible = false;
+                badge.innerText = "MODE: PHYSICS";
+                badge.className = "mode-badge mode-physics";
+                cBuild.style.display = 'none';
+                cPhys.style.display = 'block';
+                crosshair.style.opacity = '1'; // 顯示準心
+                activatePhysics();
+                params.mode = 'Physics'; // 同步 GUI 狀態
+            } else {
+                physicsEnabled = false;
+                rollOverMesh.visible = true;
+                badge.innerText = "MODE: BUILD";
+                badge.className = "mode-badge mode-build";
+                cBuild.style.display = 'block';
+                cPhys.style.display = 'none';
+                crosshair.style.opacity = '0.3'; // 建造時淡化準心
+                params.mode = 'Build';
+            }
+        }
+
+        function activatePhysics() {
+            const validMeshes = objects.filter(obj => obj !== plane);
+            validMeshes.forEach(mesh => {
+                if (!mesh.userData.hasPhysics) {
+                    let shape;
+                    const geoType = mesh.geometry.type;
+
+                    if (geoType === 'BoxGeometry') shape = new CANNON.Box(new CANNON.Vec3(25, 25, 25));
+                    else if (geoType === 'SphereGeometry') shape = new CANNON.Sphere(25);
+                    else if (geoType === 'CylinderGeometry') shape = new CANNON.Cylinder(25, 25, 50, 16);
+                    else if (geoType === 'ConeGeometry') shape = new CANNON.Cylinder(0, 25, 50, 16);
+                    else if (geoType === 'TorusGeometry') shape = new CANNON.Sphere(30);
+
+                    if (shape) {
+                        const body = new CANNON.Body({
+                            mass: 5,
+                            position: new CANNON.Vec3(mesh.position.x, mesh.position.y, mesh.position.z),
+                            material: cannonMaterials.default
+                        });
+                        body.quaternion.copy(mesh.quaternion);
+
+                        if (geoType === 'CylinderGeometry' || geoType === 'ConeGeometry') {
+                             const q = new CANNON.Quaternion();
+                             q.setFromAxisAngle(new CANNON.Vec3(1,0,0),-Math.PI/2);
+                             body.addShape(shape, new CANNON.Vec3(0,0,0), q);
+                        } else {
+                            body.addShape(shape);
+                        }
+                        world.addBody(body);
+                        objectsToUpdate.push({ mesh: mesh, body: body });
+                        mesh.userData.hasPhysics = true;
+                    }
+                } else {
+                    const pair = objectsToUpdate.find(p => p.mesh === mesh);
+                    if(pair) { pair.body.wakeUp(); pair.body.velocity.set(0,0,0); }
+                }
+            });
+        }
+
+        function updateGhost() {
+            scene.remove(rollOverMesh);
+            const newGeo = geometries[params.shape];
+            rollOverMaterial.color.set(params.color);
+            rollOverMesh = new THREE.Mesh(newGeo, rollOverMaterial);
+            if (params.shape === 'Pyramid' || params.shape === 'Cone') rollOverMesh.geometry.center();
+            scene.add(rollOverMesh);
+        }
+
+        function resetScene() {
+            objects.slice(1).forEach(obj => scene.remove(obj));
+            objects = [plane];
+            objectsToUpdate.forEach(item => world.removeBody(item.body));
+            objectsToUpdate = [];
+            switchMode('Build');
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function onPointerMove(event) {
+            if (physicsEnabled) return;
+            pointer.set((event.clientX / window.innerWidth) * 2 - 1, -(event.clientY / window.innerHeight) * 2 + 1);
+            raycaster.setFromCamera(pointer, camera);
+            const intersects = raycaster.intersectObjects(objects, false);
+            if (intersects.length > 0) {
+                const intersect = intersects[0];
+                rollOverMesh.position.copy(intersect.point).add(intersect.face.normal);
+                rollOverMesh.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+            }
+        }
+
+        function onPointerDown(event) {
+            if (event.target.closest('.lil-gui')) return;
+
+            pointer.set((event.clientX / window.innerWidth) * 2 - 1, -(event.clientY / window.innerHeight) * 2 + 1);
+            raycaster.setFromCamera(pointer, camera);
+
+            // 模式分支
+            if (!physicsEnabled) {
+                // === 建造模式 ===
+                const intersects = raycaster.intersectObjects(objects, false);
+                if (intersects.length > 0) {
+                    const intersect = intersects[0];
+                    if (event.button === 0) { 
+                        const material = new THREE.MeshStandardMaterial({ color: params.color, roughness: 0.3, metalness: 0.2 });
+                        const voxel = new THREE.Mesh(geometries[params.shape], material);
+                        voxel.castShadow = true; voxel.receiveShadow = true;
+                        voxel.position.copy(intersect.point).add(intersect.face.normal);
+                        voxel.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+                        if(params.shape === 'Donut') voxel.rotation.x = -Math.PI / 2;
+                        scene.add(voxel); objects.push(voxel);
+                    } else if (event.button === 2) { 
+                        if (intersect.object !== plane) {
+                            scene.remove(intersect.object);
+                            objects.splice(objects.indexOf(intersect.object), 1);
+                        }
+                    }
+                }
+            } else {
+                // === 物理模式 ===
+                if (event.button === 0) { 
+                    // 左鍵：朝游標位置發射
+                    fireFromMouse(pointer);
+                }
+            }
+        }
+
+        // --- 發射邏輯 A: 從攝影機中心發射 (按鈕用) ---
+        function fireFromCamera() {
+            // 自動開啟物理模式，避免卡彈
+            if (!physicsEnabled) switchMode('Physics');
+
+            const shootDir = new THREE.Vector3();
+            camera.getWorldDirection(shootDir); // 攝影機正前方
+            
+            const startPos = new THREE.Vector3();
+            startPos.copy(camera.position).add(shootDir.clone().multiplyScalar(80)); // 稍微前方一點生成
+            
+            spawnBall(startPos, shootDir);
+        }
+
+        // --- 發射邏輯 B: 從攝影機朝游標發射 (滑鼠用) ---
+        function fireFromMouse(pointerCoord) {
+            if (!physicsEnabled) switchMode('Physics');
+
+            raycaster.setFromCamera(pointerCoord, camera);
+            
+            // 射線方向就是發射方向
+            const shootDir = raycaster.ray.direction.clone().normalize();
+            
+            const startPos = new THREE.Vector3();
+            startPos.copy(camera.position).add(shootDir.clone().multiplyScalar(80));
+
+            spawnBall(startPos, shootDir);
+        }
+
+        // --- 產生實體砲彈 ---
+        function spawnBall(position, direction) {
+            const radius = params.ballSize;
+            
+            // 視覺 Mesh
+            const ballMesh = new THREE.Mesh(
+                new THREE.SphereGeometry(radius, 32, 32),
+                new THREE.MeshStandardMaterial({ color: 0xff4400, emissive: 0xff0000, emissiveIntensity: 0.8 })
+            );
+            ballMesh.castShadow = true;
+            ballMesh.position.copy(position);
+            scene.add(ballMesh);
+
+            // 物理 Body
+            const ballBody = new CANNON.Body({
+                mass: 100, // 高質量
+                position: new CANNON.Vec3(position.x, position.y, position.z),
+                shape: new CANNON.Sphere(radius),
+                material: cannonMaterials.default
+            });
+            
+            // 速度
+            const velocity = direction.multiplyScalar(params.ballSpeed * 10);
+            ballBody.velocity.set(velocity.x, velocity.y, velocity.z);
+            
+            world.addBody(ballBody);
+            objectsToUpdate.push({ mesh: ballMesh, body: ballBody });
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (physicsEnabled && world) {
+                world.step(1 / 60);
+                for (const obj of objectsToUpdate) {
+                    obj.mesh.position.copy(obj.body.position);
+                    obj.mesh.quaternion.copy(obj.body.quaternion);
+                }
+            }
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
